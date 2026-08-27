@@ -21,11 +21,6 @@ mkdir -p "$BUILD/d9mtmetal" "$PREBUILT" "$DIST/x86_64-windows" "$DIST/x86_64-uni
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
-# ---------------------------------------------------------------------------
-# Fetch the latest DXMT builtin release and keep only the x86_64 winemetal
-# pieces. d9mt's upstream fetch script currently generates only an i686 import
-# library, so CI creates the 64-bit import library below.
-# ---------------------------------------------------------------------------
 DXMT_REPO="${DXMT_REPO:-3Shain/dxmt}"
 API="https://api.github.com/repos/${DXMT_REPO}/releases/latest"
 CURL_HEADERS=()
@@ -71,9 +66,8 @@ tar -xzf "$TMP/dxmt-builtin.tar.gz" -C "$TMP" \
 cp "$TMP/$WINEMETAL_DLL_PATH" "$PREBUILT/winemetal.dll"
 cp "$TMP/$WINEMETAL_SO_PATH" "$PREBUILT/winemetal.so"
 
-# Generate a 64-bit GNU import library from winemetal.dll exports. Newer
-# binutils prints the name table as "[  0] Symbol"; older variants used an
-# address-like first field, so accept both formats.
+# Generate a 64-bit GNU import library from winemetal.dll exports. Support
+# both the old short objdump table and current binutils' +base/hint format.
 python3 - "$PREBUILT/winemetal.dll" "$PREBUILT/winemetal64.def" <<'PY'
 import re
 import subprocess
@@ -90,18 +84,23 @@ marker_pos = out.find('[Ordinal/Name Pointer] Table')
 if marker_pos < 0:
     raise SystemExit('Name Pointer Table not found in winemetal.dll')
 
+patterns = [
+    re.compile(r'\s*\[\s*\d+\]\s+\+base\[\s*\d+\]\s+[0-9A-Fa-f]+\s+(\S+)\s*$'),
+    re.compile(r'\s*\[\s*\d+\]\s+(\S+)\s*$'),
+    re.compile(r'\s+[0-9A-Fa-f]+\s+(\S+)\s*$'),
+]
+
 names = []
 for line in out[marker_pos:].splitlines()[1:]:
     if names and not line.strip():
         break
     if 'Base Relocations' in line or 'The Function Table' in line:
         break
-
-    m = re.match(r'\s*\[\s*\d+\]\s+(\S+)\s*$', line)
-    if not m:
-        m = re.match(r'\s+[0-9A-Fa-f]+\s+(\S+)\s*$', line)
-    if m:
-        names.append(m.group(1))
+    for pattern in patterns:
+        m = pattern.match(line)
+        if m:
+            names.append(m.group(1))
+            break
 
 if not names:
     print(out[marker_pos:marker_pos + 4096], file=sys.stderr)
@@ -120,10 +119,6 @@ PY
   -l "$PREBUILT/libwinemetal64.a" \
   --dllname winemetal.dll
 
-# ---------------------------------------------------------------------------
-# Build the x86_64 d9mtmetal builtin PE + x86_64 Mach-O unixlib. This is the
-# runtime bridge used by d3d9.dll for Metal calls that DXMT winemetal lacks.
-# ---------------------------------------------------------------------------
 D9OUT="$BUILD/d9mtmetal"
 cat > "$D9OUT/ntdll-cx64.def" <<'EOF'
 LIBRARY ntdll.dll
@@ -166,11 +161,6 @@ clang -ObjC -dynamiclib -arch x86_64 -O2 \
   -framework Metal \
   -framework Foundation
 
-# ---------------------------------------------------------------------------
-# Reuse upstream's working DXVK D3D9 frontend build, but patch only the
-# architecture-specific pieces in a temporary copy. The upstream i686 script
-# remains untouched in the repository.
-# ---------------------------------------------------------------------------
 PATCHED="$BUILD/build-dxvkfe-x64.sh"
 python3 - "$ROOT/scripts/build-dxvkfe.sh" "$PATCHED" <<'PY'
 from pathlib import Path
@@ -195,8 +185,6 @@ for line in src.splitlines():
         line = 'CC=x86_64-w64-mingw32-gcc'
         seen['cc'] = True
     elif '-mpreferred-stack-boundary=2' in line:
-        # Win64 already has SSE2 in the ABI; the i686 stack boundary flag is
-        # invalid/inappropriate here.
         seen['stack'] = True
         continue
     elif '-Wl,--file-alignment=4096,--enable-stdcall-fixup,--kill-at' in line:
@@ -223,16 +211,11 @@ PY
 chmod +x "$PATCHED"
 RELEASE=1 bash "$PATCHED"
 
-# Fail CI if we accidentally produced an i686 PE.
 "$MINGW-objdump" -f "$BUILD/d3d9fe.dll" | tee "$BUILD/d3d9fe-x64.txt"
 grep -q 'file format pei-x86-64' "$BUILD/d3d9fe-x64.txt"
 "$MINGW-objdump" -f "$D9OUT/d9mtmetal.dll" | tee "$BUILD/d9mtmetal-x64.txt"
 grep -q 'file format pei-x86-64' "$BUILD/d9mtmetal-x64.txt"
 
-# ---------------------------------------------------------------------------
-# Runtime package. d3d9.dll goes beside the x64 game executable (or another
-# native-DLL search location); d9mtmetal/winemetal are Wine builtins/unixlibs.
-# ---------------------------------------------------------------------------
 cp "$BUILD/d3d9fe.dll" "$DIST/d3d9.dll"
 cp "$D9OUT/d9mtmetal.dll" "$DIST/x86_64-windows/d9mtmetal.dll"
 cp "$D9OUT/d9mtmetal.so" "$DIST/x86_64-unix/d9mtmetal.so"
