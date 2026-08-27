@@ -1,0 +1,98 @@
+name: Build d9mt x64
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: d9mt-x64-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build x86_64 D3D9 to Metal
+    runs-on: macos-15
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install build dependencies
+        run: |
+          brew install mingw-w64 glslang
+
+      - name: Build x64 package
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          python3 scripts/patch-x64-sources.py
+          bash scripts/build-x64-ci.sh
+
+      - name: Verify artifacts
+        run: |
+          set -euo pipefail
+          x86_64-w64-mingw32-objdump -f dist/d9mt-x64/d3d9.dll
+          x86_64-w64-mingw32-objdump -f dist/d9mt-x64/x86_64-windows/d9mtmetal.dll
+          shasum -a 256 dist/d9mt-x64.zip
+
+      - name: Upload x64 package
+        uses: actions/upload-artifact@v7
+        with:
+          name: d9mt-x64-${{ github.sha }}
+          path: dist/d9mt-x64.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
+      - name: Upload build logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: d9mt-x64-logs-${{ github.sha }}
+          path: |
+            build/dxvkfe-link.log
+            build/d3d9fe-x64.txt
+            build/d9mtmetal-x64.txt
+          if-no-files-found: ignore
+          retention-days: 14
+
+  release:
+    name: Publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download package
+        uses: actions/download-artifact@v7
+        with:
+          pattern: d9mt-x64-${{ github.sha }}
+          path: release-artifact
+          merge-multiple: true
+
+      - name: Publish release asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test -f release-artifact/d9mt-x64.zip
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" release-artifact/d9mt-x64.zip \
+              --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" release-artifact/d9mt-x64.zip \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "d9mt x64 $GITHUB_REF_NAME" \
+              --generate-notes
+          fi
