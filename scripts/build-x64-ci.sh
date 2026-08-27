@@ -71,7 +71,9 @@ tar -xzf "$TMP/dxmt-builtin.tar.gz" -C "$TMP" \
 cp "$TMP/$WINEMETAL_DLL_PATH" "$PREBUILT/winemetal.dll"
 cp "$TMP/$WINEMETAL_SO_PATH" "$PREBUILT/winemetal.so"
 
-# Generate a 64-bit GNU import library from winemetal.dll exports.
+# Generate a 64-bit GNU import library from winemetal.dll exports. Newer
+# binutils prints the name table as "[  0] Symbol"; older variants used an
+# address-like first field, so accept both formats.
 python3 - "$PREBUILT/winemetal.dll" "$PREBUILT/winemetal64.def" <<'PY'
 import re
 import subprocess
@@ -83,26 +85,34 @@ out = subprocess.check_output(
     text=True,
     errors='replace',
 )
-marker = '[Ordinal/Name Pointer] Table -- Ordinal Base 1'
-pos = out.find(marker)
-if pos < 0:
+
+marker_pos = out.find('[Ordinal/Name Pointer] Table')
+if marker_pos < 0:
     raise SystemExit('Name Pointer Table not found in winemetal.dll')
 
 names = []
-for line in out[pos:].splitlines()[1:]:
-    if 'Base Relocations' in line or 'Relocations' in line:
+for line in out[marker_pos:].splitlines()[1:]:
+    if names and not line.strip():
         break
-    m = re.match(r'\s+[0-9A-Fa-f]+\s+(\S+)\s*$', line)
+    if 'Base Relocations' in line or 'The Function Table' in line:
+        break
+
+    m = re.match(r'\s*\[\s*\d+\]\s+(\S+)\s*$', line)
+    if not m:
+        m = re.match(r'\s+[0-9A-Fa-f]+\s+(\S+)\s*$', line)
     if m:
         names.append(m.group(1))
 
 if not names:
+    print(out[marker_pos:marker_pos + 4096], file=sys.stderr)
     raise SystemExit('No exports parsed from winemetal.dll')
 
 with open(out_def, 'w', encoding='utf-8') as f:
     f.write('LIBRARY winemetal.dll\nEXPORTS\n')
     for name in names:
         f.write(f'  {name}\n')
+
+print(f'[x64] parsed {len(names)} winemetal exports')
 PY
 
 "$MINGW-dlltool" \
