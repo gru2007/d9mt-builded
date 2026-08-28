@@ -3892,10 +3892,68 @@ namespace dxvk {
     this->prepareImage(dstView->image(), dstView->imageSubresources());
     this->prepareImage(srcView->image(), srcView->imageSubresources());
 
-    if (srcView->image()->info().sampleCount != VK_SAMPLE_COUNT_1_BIT
-     || dstView->image()->info().sampleCount != VK_SAMPLE_COUNT_1_BIT) {
-      Logger::err("d9mt: blitImageView: multisampled blit not implemented");
+    // The source the sample pass actually reads. A multisampled source is
+    // resolved into a transient 1-sample image first: Metal cannot sample an
+    // MSAA texture from the blit shader, and the front-end only lands here
+    // with one when the copy also scales or converts formats, so its own
+    // resolve fast path did not apply. Dropping the blit instead loses a
+    // framebuffer copy the game reads back the same frame (Source's glow
+    // scene backup, UpdateScreenEffectTexture) and paints black over the
+    // whole scene.
+    Rc<DxvkImage> srcImage = srcView->image();
+    uint32_t      srcMip   = srcView->imageSubresources().baseMipLevel;
+    uint32_t      srcLayer = srcView->imageSubresources().baseArrayLayer;
+
+    if (dstView->image()->info().sampleCount != VK_SAMPLE_COUNT_1_BIT) {
+      Logger::err("d9mt: blitImageView: multisampled destination not implemented");
       return;
+    }
+
+    if (srcImage->info().sampleCount != VK_SAMPLE_COUNT_1_BIT) {
+      VkExtent3D msaaExtent = srcImage->mipLevelExtent(srcMip);
+
+      DxvkImageCreateInfo tmpInfo = { };
+      tmpInfo.type        = VK_IMAGE_TYPE_2D;
+      tmpInfo.format      = srcImage->info().format;
+      tmpInfo.flags       = 0u;
+      tmpInfo.sampleCount = VK_SAMPLE_COUNT_1_BIT;
+      tmpInfo.extent      = { msaaExtent.width, msaaExtent.height, 1u };
+      tmpInfo.numLayers   = 1u;
+      tmpInfo.mipLevels   = 1u;
+      tmpInfo.usage       = VK_IMAGE_USAGE_SAMPLED_BIT
+                          | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT
+                          | VK_IMAGE_USAGE_TRANSFER_SRC_BIT
+                          | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+      tmpInfo.stages      = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+      tmpInfo.access      = VK_ACCESS_SHADER_READ_BIT;
+      tmpInfo.tiling      = VK_IMAGE_TILING_OPTIMAL;
+      tmpInfo.layout      = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+      Rc<DxvkImage> resolved;
+
+      try {
+        resolved = m_device->createImage(tmpInfo, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+      } catch (const DxvkError& e) {
+        Logger::err(str::format("d9mt: blitImageView: failed to create resolve "
+          "image: ", e.message()));
+        return;
+      }
+
+      VkImageResolve region = { };
+      region.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, srcMip, srcLayer, 1u };
+      region.srcOffset      = { 0, 0, 0 };
+      region.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0u, 0u, 1u };
+      region.dstOffset      = { 0, 0, 0 };
+      region.extent         = msaaExtent;
+
+      this->resolveImage(resolved, srcImage, region, srcImage->info().format,
+        VK_RESOLVE_MODE_AVERAGE_BIT, VK_RESOLVE_MODE_NONE);
+
+      // resolveImage spills and re-prepares on its own; carry on against the
+      // resolved 1-sample image as if it had been the source all along
+      srcImage = std::move(resolved);
+      srcMip   = 0u;
+      srcLayer = 0u;
     }
 
     if (dstView->formatInfo()->aspectMask
@@ -3954,8 +4012,29 @@ namespace dxvk {
       return;
     }
 
-    // 2D sample view of the source (carries the view swizzle)
-    obj_handle_t srcHandle = obj_handle_t(srcView->handle(VK_IMAGE_VIEW_TYPE_2D));
+    // 2D sample view of the source (carries the view swizzle). Built from the
+    // image rather than taken off srcView: the d3d9 front-end creates its blit
+    // views with TRANSFER_SRC usage, and DxvkImageView::createView — like
+    // upstream, which builds its own sampled view for the meta-blit pass —
+    // hands back no descriptor for a view that is neither sampled, storage nor
+    // an attachment. Asking srcView for a handle therefore failed for *every*
+    // StretchRect that scales or converts, silently dropping the copy.
+    DxvkImageViewKey srcKey = { };
+    srcKey.viewType      = VK_IMAGE_VIEW_TYPE_2D;
+    srcKey.usage         = VK_IMAGE_USAGE_SAMPLED_BIT;
+    srcKey.format        = srcView->info().format;
+    srcKey.aspects       = srcView->info().aspects;
+    srcKey.mipIndex      = uint8_t(srcMip);
+    srcKey.mipCount      = 1u;
+    srcKey.layerIndex    = uint16_t(srcLayer);
+    srcKey.layerCount    = 1u;
+    srcKey.layout        = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    srcKey.packedSwizzle = srcView->info().packedSwizzle;
+
+    Rc<DxvkImageView> srcSampled = srcImage->createView(srcKey);
+    obj_handle_t srcHandle = srcSampled != nullptr
+      ? obj_handle_t(srcSampled->handle()) : 0u;
+
     if (!srcHandle) {
       Logger::err("d9mt: blitImageView: failed to create 2D source view");
       return;
@@ -4044,7 +4123,7 @@ namespace dxvk {
     d9mt::cmdListEndEncoder(m_cmd.ptr());
 
     m_cmd->track(dstView->image(), DxvkAccess::Write);
-    m_cmd->track(srcView->image(), DxvkAccess::Read);
+    m_cmd->track(srcImage, DxvkAccess::Read);
   }
 
 
