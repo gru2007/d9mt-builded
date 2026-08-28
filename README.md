@@ -106,8 +106,9 @@ All performance features are **on by default**; set to `0` to disable for A/B.
 | var | default | effect |
 |-----|---------|--------|
 | `D9MT_METALLIB_CACHE` | on | shader disk cache (compile once, reload forever) |
-| `D9MT_ASYNC` | on | compile pipelines on background threads (no compile-freeze) |
-| `D9MT_PSO_DEADLINE_MS` | `100` | how long a draw may keep being skipped for a pipeline that isn't compiled yet before it compiles it inline. `0` = never (pure async: geometry appears whenever the workers get to it) |
+| `D9MT_ASYNC` | on | pre-warm and compile pipelines on background threads; a cold first use still waits by default for correctness |
+| `D9MT_ASYNC_SKIP` | off | allow draws to be dropped while their pipeline compiles. This may reduce first-use stutter, but can produce black/incomplete frames; intended only for comparison and profiling |
+| `D9MT_PSO_DEADLINE_MS` | `100` | with `D9MT_ASYNC_SKIP=1`, how long a draw may keep being skipped before it compiles the pipeline inline. `0` = never |
 | `D9MT_PSO_PREWARM` | on | replay the recorded pipeline set at startup (`d9mt_pso_cache.bin` in the game dir) |
 | `D9MT_BATCH` | on | batch render commands into one bridge crossing |
 | `D9MT_SUBALLOC` | on | suballocate dynamic buffers (kills DISCARD churn) |
@@ -122,13 +123,16 @@ Example — run with the cache off to measure cold compile:
 
 ### A black world with a working HUD
 
-Async pipeline compilation means a draw whose Metal pipeline isn't built yet is
-**skipped**, not stalled — so while a level's pipelines build, the geometry that
-needs them is simply absent. In a game that draws its world with shaders it
-created moments earlier (any Source title), that reads as a black screen with a
-perfectly good HUD and viewmodel on top of it, for as long as the backlog takes.
+Dropping a draw whose Metal pipeline is still being built is not semantically
+safe. In a game that draws its world with shaders it created moments earlier
+(any Source title), that reads as a black screen with a perfectly good HUD and
+viewmodel on top. D9MT therefore blocks the first use of a cold pipeline by
+default: it takes a queued compile onto the draw thread, or waits for the worker
+that already owns it. Recorded pipelines are still pre-warmed asynchronously.
+Set `D9MT_ASYNC_SKIP=1` only to restore the old, deliberately lossy behaviour.
 
-Three things bound it, all in `src/d3d9fe/d9mt_context.cpp`:
+When lossy skipping is explicitly enabled, three things bound it, all in
+`src/d3d9fe/d9mt_context.cpp`:
 
 - **Two compile lanes.** A pipeline a draw is blocked on goes to an urgent queue
   with normal-priority workers; speculative pre-warm work stays on the
