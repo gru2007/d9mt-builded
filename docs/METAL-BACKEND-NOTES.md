@@ -708,9 +708,15 @@ tells you exactly what moved).
 10. **blitImageView general path**: fullscreen-triangle sample pass (the
     presenter blit pipeline, now exported via d9mt_backend.h getBlitPso
     with a NEAREST variant) into an identity-swizzle COLOR_ATTACHMENT view
-    of the destination subresource, sampling the source's 2D view (carries
-    the view swizzle). Mirroring normalized into forward dst rect +
-    negative uv scale. Depth/MSAA/3D/array blits fail loud.
+    of the destination subresource, sampling a SAMPLED 2D view built from
+    the source IMAGE (the front-end's own blit views carry TRANSFER_SRC
+    usage, for which createView returns no descriptor — upstream likewise
+    builds its own sampled view for the meta-blit pass; the built view
+    carries the source view's format, subresource and swizzle). A
+    multisampled source is resolved into a 1-sample image first, cached per
+    device/format/size. Mirroring normalized into forward dst rect +
+    negative uv scale. Depth/3D/array blits and multisampled destinations
+    fail loud.
 11. **copyImage cross-format** (raw-bit Vulkan semantics): transient
     MTLTexture_newTextureView of the DESTINATION subresource in the
     source's WMT format (PixelFormatView usage from the resources stage),
@@ -1170,7 +1176,23 @@ waitUntilCompleted; see "Stage decisions: device" item 4).
       windowed→fullscreen 1280x720→fullscreen desktop→windowed Reset chain;
       full 12-test FE suite green, zero stub hits; all build scripts green.
       See "GTA IV fullscreen Reset fixes" section above for residuals.
+- [x] Source framebuffer-copy fixes (2026-08-28): every scaling or
+      format-converting StretchRect was silently dropped. blitImageView asked
+      the front-end's source view for its Metal texture, but d3d9 creates those
+      views with TRANSFER_SRC usage and DxvkImageView::createView — like
+      upstream, which builds its own sampled view for the meta-blit pass —
+      returns no descriptor for a view that is neither sampled, storage nor an
+      attachment; the sampled view is now built from the source image instead.
+      A multisampled source (the game's own MSAA scene) is resolved into a
+      1-sample image first, cached per device/format/size because the pass runs
+      two or three times a frame; only a multisampled destination still fails
+      loud. Measured in Team Frontress (TF2 client): ~2.2 dropped copies per
+      frame, which is the glow-outline pass (scene backup -> clear framebuffer
+      -> draw glow models -> restore backup) losing its backup and painting
+      black over the entire world, while the HUD, viewmodel, nameplates and
+      glow silhouettes drawn after it looked perfectly normal.
 - [ ] Remaining context ops, backlog (DISCARD-rename suballocator, gamma LUT,
       software cursor, per-vis-buffer cap of 8192 occlusion spans per
       submission, partial-region resolves, packed D24S8/D16 depth buffer
-      copies (Lock of depth surfaces), MSAA/depth/3D blitImageView)
+      copies (Lock of depth surfaces), depth/3D/array blitImageView and
+      multisampled blit destinations)

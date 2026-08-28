@@ -123,6 +123,42 @@ Example — run with the cache off to measure cold compile:
 
 ### A black world with a working HUD
 
+Two unrelated faults look like this, and the log tells them apart.
+
+#### A dropped framebuffer copy (fixed)
+
+Source does not hand the finished frame straight to the swap chain. Several
+passes copy the framebuffer into a render-target texture and paint that texture
+back over the whole screen: the glow-outline pass copies the scene into a backup
+target, clears the framebuffer to black, draws every glowing entity in flat
+colour and then restores the backup; motion blur and the engine's post
+processing do the same through `_rt_FullFrameFB`. Those copies scale or convert
+format — the glow targets are `RGBA16161616F` under HDR — so the d3d9 front-end
+sends them down `blitImageView` rather than its copy/resolve fast paths, and
+both ways `blitImageView` had of refusing one fired on every frame of a Source
+game:
+
+- **`failed to create 2D source view`.** The front-end hands the copy's source
+  over as a view created with `VK_IMAGE_USAGE_TRANSFER_SRC_BIT`, and
+  `DxvkImageView::createView` — like upstream, which builds its own sampled view
+  for the meta-blit pass — returns no descriptor for a view that is neither
+  sampled, storage nor an attachment. The sampled view is now built from the
+  source image instead, carrying the view's format, subresource and swizzle.
+- **`multisampled blit not implemented`.** With antialiasing on, that same
+  source is the multisampled scene, which Metal cannot sample from the blit
+  shader. It is now resolved into a 1-sample image first — cached per device,
+  format and size, since the pass runs two or three times a frame — and the
+  sample pass reads the resolved copy. Only a multisampled *destination* still
+  fails loud.
+
+Lose the copy and the backup target is never written, so the pass that restores
+it paints a full-screen black rectangle over the world and everything in it.
+What survives is whatever is drawn afterwards: the glow silhouettes, the
+viewmodel, the HUD, the nameplates. Any `blitImageView:` line left in the log is
+a copy D9MT still cannot perform, and it names the operation.
+
+#### A skipped draw (off by default)
+
 Dropping a draw whose Metal pipeline is still being built is not semantically
 safe. In a game that draws its world with shaders it created moments earlier
 (any Source title), that reads as a black screen with a perfectly good HUD and
@@ -143,7 +179,9 @@ When lossy skipping is explicitly enabled, three things bound it, all in
   fills in at reduced frame rate instead of freezing or staying black.
 - **A stall report**, in the release build too: `d3d9fe.log` (next to the game's
   exe) gets a `d9mt: PSO stall:` line about once a second while draws are being
-  dropped, with the queue depths. No line = the black screen is something else.
+  dropped, with the queue depths. No line, and the screen still black, means the
+  dropped-copy failure above — which reports itself on the `err:` channel, not in
+  `d3d9fe.log`.
 
 ## How it works (deeper)
 
