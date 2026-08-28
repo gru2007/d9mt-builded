@@ -17,6 +17,7 @@
 // All caches are process-global and hold Rc<DxvkShader> refs for the process
 // lifetime (upstream's pipeline manager has the same lifetime policy).
 
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -452,9 +453,11 @@ namespace dxvk::d9mt {
     struct CompileEntry {
       Rc<DxvkShader>                  shader;   // keeps the key pointer alive
       std::unique_ptr<CompiledShader> compiled; // null = failed (cached)
+      bool                            ready = false; // compile finished
     };
 
     std::mutex s_compileMutex;
+    std::condition_variable s_compileCond;
     std::unordered_map<CompileKey, CompileEntry, CompileKeyHash, CompileKeyEq>
       s_compileCache;
 
@@ -469,18 +472,56 @@ namespace dxvk::d9mt {
 
     CompileKey key = { shader.ptr(), moduleInfo };
 
-    std::lock_guard<std::mutex> lock(s_compileMutex);
+    // The cache lock guards the MAP, never the compile. Holding it across
+    // SPIR-V -> MSL -> metallib serialized every PSO worker into one, which
+    // silently undid the whole point of a worker pool: with the pool pinned to
+    // one effective thread, a level's worth of new pipelines takes as long to
+    // build as it would have on the frame thread — and every draw waiting on
+    // one of them is dropped meanwhile (a black world with a live HUD).
+    //
+    // So: publish an unfinished entry under the lock, compile outside it, and
+    // let anyone who wants the same (shader, moduleInfo) wait on the condvar.
+    // References into an unordered_map stay valid across rehashes, and entries
+    // are never erased, so the pointer below outlives the unlocked window.
+    std::unique_lock<std::mutex> lock(s_compileMutex);
 
-    auto entry = s_compileCache.find(key);
-    if (entry != s_compileCache.end())
-      return entry->second.compiled.get();
+    auto it = s_compileCache.find(key);
+    if (it != s_compileCache.end()) {
+      CompileEntry* existing = &it->second;
+      s_compileCond.wait(lock, [existing] { return existing->ready; });
+      return existing->compiled.get();
+    }
 
     CompileEntry newEntry;
-    newEntry.shader   = shader;
-    newEntry.compiled = compileShader(shader, moduleInfo);
+    newEntry.shader = shader;
 
-    return s_compileCache.emplace(key, std::move(newEntry))
-      .first->second.compiled.get();
+    CompileEntry* entry = &s_compileCache.emplace(key, std::move(newEntry))
+      .first->second;
+
+    lock.unlock();
+
+    std::unique_ptr<CompiledShader> compiled;
+
+    try {
+      compiled = compileShader(shader, moduleInfo);
+    } catch (...) {
+      // Publishing the (failed, null) entry is not optional: a waiter blocked
+      // on this key would never be woken otherwise.
+      lock.lock();
+      entry->ready = true;
+      lock.unlock();
+      s_compileCond.notify_all();
+      throw;
+    }
+
+    lock.lock();
+
+    entry->compiled = std::move(compiled);
+    entry->ready    = true;
+    lock.unlock();
+
+    s_compileCond.notify_all();
+    return entry->compiled.get();
   }
 
 

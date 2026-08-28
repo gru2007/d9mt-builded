@@ -14,8 +14,10 @@ BUILD="$ROOT/build"
 GEN="$BUILD/dxvkfe-gen"
 
 # RELEASE=1 -> max-speed production build: -O3 + LTO, asserts stripped, and
-# the in-engine trace + file logging COMPILED OUT (not just runtime-disabled),
-# so there is zero instrumentation on the hot path. A separate object cache
+# the in-engine trace + the chatty per-object logf() COMPILED OUT (not just
+# runtime-disabled), so there is zero instrumentation on the hot path. The rare
+# logAlways() diagnostics (worker startup, pipeline stalls) stay in: a shipped
+# build has to be able to say why the screen was black. A separate object cache
 # keeps the dev (-O2, traced) and release object trees from clashing — flags
 # only take effect on a recompile, and mtime caching can't see a flag change.
 RELEASE="${RELEASE:-0}"
@@ -31,7 +33,7 @@ if [[ "$RELEASE" == 1 ]]; then
   OPT_FLAGS=(-O3 -funroll-loops -fno-math-errno
              -DNDEBUG -DD9MT_NO_TRACE -DD9MT_NO_LOG)
   LINK_OPT=(-O3)
-  echo "[dxvkfe] RELEASE build — max speed (-O3, no trace, no logging)"
+  echo "[dxvkfe] RELEASE build — max speed (-O3, no trace, no per-object logging)"
 elif [[ "$TRACY" == 1 ]]; then
   # TRACY=1 -> Tracy frame profiler client compiled in. Manual ZoneScoped
   # zones only (sampling / callstack / system tracing disabled — those need

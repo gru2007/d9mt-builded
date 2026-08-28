@@ -33,30 +33,63 @@ namespace dxvk::d9mt {
   // logging: d3d9fe.log in the process cwd (same pattern as d9mt.log in the
   // hand-rolled driver). stderr is swallowed by winewrapper, so the file is
   // the only reliable channel.
+  //
+  // Two channels share that one file:
+  //   logf()     — chatty, per-shader/per-object tracing. Compiled OUT of the
+  //                RELEASE build (-DD9MT_NO_LOG), which is what ships.
+  //   logAlways() — rare, diagnosis-grade events (worker startup, pipeline
+  //                stalls, compile failures). ALWAYS compiled in: a shipped
+  //                build that can't say why the screen was black for ten
+  //                seconds is a build nobody can debug. Never call it from a
+  //                per-draw path — it takes a lock and flushes.
   // -------------------------------------------------------------------------
+
+  namespace detail {
+
+    inline std::mutex& logMutex() {
+      static std::mutex s_mutex;
+      return s_mutex;
+    }
+
+    // One handle for both channels, so a release build (logf compiled out) and
+    // a dev build (both live) can't end up opening "d3d9fe.log" twice and
+    // truncating each other's output.
+    inline FILE* logFile() {
+      static FILE* s_file = std::fopen("d3d9fe.log", "w");
+      return s_file;
+    }
+
+    inline void vlogf(const char* fmt, va_list ap) {
+      std::lock_guard<std::mutex> lock(logMutex());
+
+      FILE* file = logFile();
+      if (!file)
+        return;
+
+      std::vfprintf(file, fmt, ap);
+      std::fputc('\n', file);
+      std::fflush(file);
+    }
+
+  }
 
   inline void logf(const char* fmt, ...) {
 #ifndef D9MT_NO_LOG
-    static std::mutex s_mutex;
-    static FILE*      s_file = nullptr;
-
-    std::lock_guard<std::mutex> lock(s_mutex);
-
-    if (!s_file) {
-      s_file = std::fopen("d3d9fe.log", "w");
-      if (!s_file)
-        return;
-    }
-
     va_list ap;
     va_start(ap, fmt);
-    std::vfprintf(s_file, fmt, ap);
+    detail::vlogf(fmt, ap);
     va_end(ap);
-    std::fputc('\n', s_file);
-    std::fflush(s_file);
 #else
     (void) fmt;
 #endif
+  }
+
+  // Compiled in unconditionally — see the channel note above.
+  inline void logAlways(const char* fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    detail::vlogf(fmt, ap);
+    va_end(ap);
   }
 
   // Logs and releases an NSError handle (winemetal convention: out-params

@@ -19,6 +19,7 @@
 //    boundaries (single queue, automatic hazard tracking).
 
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -754,6 +755,16 @@ namespace dxvk::d9mt {
   // managers have the same policy); Rc refs keep the shaders alive.
   // --------------------------------------------------------------------------
 
+  // Ownership of one entry's compile. Exactly one thread ever runs the compile:
+  // whoever wins the Queued -> Running transition. That is what lets a stalled
+  // draw take a queued compile over onto the CS thread (see psoAwaitStalled)
+  // without ever racing a worker into a double compile of the same pipeline.
+  enum class PsoCompileState : uint32_t {
+    Queued  = 0,  // sitting in a worker queue, nobody has started it
+    Running = 1,  // some thread is inside compilePso for this entry
+    Done    = 2,  // compile finished — pso is set, or it failed for good
+  };
+
   struct PsoEntry {
     // pso is the readiness signal. 0 = not ready (async compile pending) OR
     // permanently failed; non-zero = ready to bind. Written LAST by the
@@ -764,6 +775,19 @@ namespace dxvk::d9mt {
     const CompiledShader* fs  = nullptr;
     Rc<DxvkShader>        vsRef;
     Rc<DxvkShader>        fsRef;
+
+    // Compile ownership (above). Only ever moves Queued -> Running -> Done.
+    std::atomic<uint32_t> compileState { uint32_t(PsoCompileState::Queued) };
+
+    // Set once by the first draw that had to skip because this pipeline was
+    // not hot yet: the entry is re-queued into the urgent lane so it jumps
+    // ahead of the pre-warm backlog, and never re-queued again after that.
+    std::atomic<uint32_t> promoted { 0 };
+
+    // steady_clock ns of that first skipped draw, 0 while no draw has waited.
+    // Once the wait exceeds the deadline the draw compiles the pipeline itself
+    // rather than dropping the geometry for another frame.
+    std::atomic<uint64_t> firstSkipNs { 0 };
   };
 
   struct PsoKey {
@@ -996,6 +1020,25 @@ namespace dxvk::d9mt {
   // until the pipeline is hot. The draw site already returns false on pso == 0,
   // so a not-ready pipeline simply defers the affected geometry by a frame or
   // two while the frame thread keeps running. Toggle with D9MT_ASYNC=0.
+  //
+  // "A frame or two" is the part that has to be enforced rather than hoped for.
+  // A game whose whole world is drawn by shaders it has only just created (any
+  // Source title: the map's material set materializes at level load) hands this
+  // pool hundreds of pipelines at once, and with a single FIFO queue the ONE
+  // pipeline the current frame is actually waiting on sits behind every
+  // speculative pre-warm compile ahead of it. The frame thread keeps running,
+  // presents on time, and draws nothing — a black world with a live HUD for as
+  // long as the backlog takes to drain, with nothing in the log to say so.
+  // Three things bound that here:
+  //
+  //   1. Two lanes. Pipelines a draw is blocked on go to an urgent queue with
+  //      its own normal-priority workers; speculative pre-warm work stays on
+  //      the lowest-priority lane it belongs on. A stalled draw also promotes
+  //      its pipeline into the urgent lane the first time it skips.
+  //   2. A deadline. If a draw has been skipping the same pipeline for longer
+  //      than D9MT_PSO_DEADLINE_MS, it compiles it inline instead — one hitch
+  //      instead of geometry that is missing indefinitely.
+  //   3. A stall report (logAlways, so it survives the release build).
   // --------------------------------------------------------------------------
 
   namespace {
@@ -1008,20 +1051,80 @@ namespace dxvk::d9mt {
       return e;
     }
 
+    // How long a draw may keep skipping one pipeline before it gives up on the
+    // workers and compiles it on the spot. 0 disables the fallback (pure
+    // dxvk-async behaviour: geometry appears whenever it appears).
+    uint64_t psoDeadlineNs() {
+      static const uint64_t ns = [] {
+        const char* v = std::getenv("D9MT_PSO_DEADLINE_MS");
+        uint64_t ms = 100u;
+        if (v && v[0]) {
+          char* end = nullptr;
+          unsigned long parsed = std::strtoul(v, &end, 10);
+          if (end && !*end)
+            ms = uint64_t(parsed);
+        }
+        return ms * 1000000ull;
+      }();
+      return ns;
+    }
+
+    uint64_t nowNs() {
+      return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+    }
+
+    // Claims the compile for this thread. Exactly one claim per entry ever
+    // succeeds, so a queued job picked up twice (promotion re-queues it into
+    // the urgent lane) compiles once, and the inline deadline path can never
+    // race a worker that already started.
+    bool claimPsoCompile(PsoEntry* entry) {
+      uint32_t expected = uint32_t(PsoCompileState::Queued);
+      return entry->compileState.compare_exchange_strong(expected,
+        uint32_t(PsoCompileState::Running), std::memory_order_acq_rel);
+    }
+
+    void finishPsoCompile(PsoEntry* entry) {
+      entry->compileState.store(uint32_t(PsoCompileState::Done),
+        std::memory_order_release);
+    }
+
+    // Stall accounting for the 1 Hz report. Draws are skipped on the CS
+    // thread(s) only; relaxed atomics are plenty.
+    std::atomic<uint64_t> s_skippedDraws   { 0 };
+    std::atomic<uint64_t> s_failedDraws    { 0 };
+    std::atomic<uint64_t> s_inlineCompiles { 0 };
+    std::atomic<uint64_t> s_lastStallLogNs { 0 };
+    std::atomic<uint64_t> s_inlineReadyNs  { 0 }; // inline-compile duty cycle
+
     class PsoWorkers {
 
     public:
 
       // Enqueue a placeholder entry (vsRef/fsRef preset, pso == 0) for
-      // background compilation. The entry pointer is stable for the process
-      // lifetime (heap node owned by s_psoCache, never erased).
-      void enqueue(const PsoKey& key, PsoEntry* entry) {
+      // compilation. The entry pointer is stable for the process lifetime
+      // (heap node owned by s_psoCache, never erased). urgent = a draw is
+      // waiting on this pipeline right now; anything else is speculative.
+      void enqueue(const PsoKey& key, PsoEntry* entry, bool urgent) {
         {
           std::unique_lock<dxvk::mutex> lk(m_mutex);
           ensureStartedLocked();
-          m_queue.push_back(Job{ key, entry });
+          if (urgent)
+            m_urgent.push_back(Job{ key, entry });
+          else
+            m_background.push_back(Job{ key, entry });
         }
-        m_cond.notify_one();
+        if (urgent)
+          m_urgentCond.notify_one();
+        else
+          m_backgroundCond.notify_one();
+      }
+
+      // Depth of both lanes, for the stall report.
+      void queueDepths(size_t* urgent, size_t* background) {
+        std::unique_lock<dxvk::mutex> lk(m_mutex);
+        *urgent     = m_urgent.size();
+        *background = m_background.size();
       }
 
       ~PsoWorkers() {
@@ -1029,7 +1132,8 @@ namespace dxvk::d9mt {
           std::unique_lock<dxvk::mutex> lk(m_mutex);
           m_stop = true;
         }
-        m_cond.notify_all();
+        m_urgentCond.notify_all();
+        m_backgroundCond.notify_all();
         for (auto& t : m_threads) {
           if (t.joinable())
             t.join();
@@ -1051,45 +1155,70 @@ namespace dxvk::d9mt {
         uint32_t hw = dxvk::thread::hardware_concurrency();
         uint32_t n  = hw > 3u ? std::min(4u, hw - 2u) : 1u;
 
+        // At least one thread on the urgent lane, and at most half the pool:
+        // urgent work is what the frame is blocked on, background work is what
+        // keeps the next few seconds smooth, and starving either one shows.
+        uint32_t urgentCount = std::max(1u, n / 2u);
+
         for (uint32_t i = 0; i < n; i++) {
-          m_threads.emplace_back([this] { run(); });
-          // Lowest priority: a compile burst (entering a new area) must not
-          // preempt the CS/draw thread off its core — that starvation is what
-          // turns a background compile into a visible frame stutter. The
-          // unixcall runs the native Metal compile on this same OS thread, so
-          // de-prioritizing here de-prioritizes the heavy work too. Compiles
-          // just take the spare cycles; geometry pops in a touch later.
-          m_threads.back().set_priority(dxvk::ThreadPriority::Lowest);
+          const bool urgent = i < urgentCount;
+          m_threads.emplace_back([this, urgent] { run(urgent); });
+          // Background lane keeps the old lowest priority: a speculative
+          // compile burst (entering a new area) must not preempt the CS/draw
+          // thread off its core — that starvation is what turns a background
+          // compile into a visible frame stutter. The unixcall runs the native
+          // Metal compile on this same OS thread, so de-prioritizing here
+          // de-prioritizes the heavy work too.
+          //
+          // The urgent lane deliberately does NOT do that. Its work is the
+          // pipeline a draw is being dropped for; running it at a priority the
+          // OS is free to starve for whole seconds is how "geometry pops in a
+          // touch later" becomes "the world is black until the compile queue
+          // drains".
+          if (!urgent)
+            m_threads.back().set_priority(dxvk::ThreadPriority::Lowest);
         }
 
-        d9mt::logf("d9mt: async PSO workers started (%u threads, low priority)", n);
+        d9mt::logAlways("d9mt: async PSO workers started (%u urgent, %u background)",
+          urgentCount, n - urgentCount);
       }
 
-      void run() {
+      void run(bool urgentLane) {
+        auto& queue = urgentLane ? m_urgent : m_background;
+        auto& cond  = urgentLane ? m_urgentCond : m_backgroundCond;
+
         for (;;) {
           Job job;
           {
             std::unique_lock<dxvk::mutex> lk(m_mutex);
-            m_cond.wait(lk, [this] { return m_stop || !m_queue.empty(); });
-            if (m_queue.empty()) {
+            cond.wait(lk, [this, &queue] { return m_stop || !queue.empty(); });
+            if (queue.empty()) {
               if (m_stop)
                 return;
               continue;
             }
-            job = m_queue.front();
-            m_queue.pop_front();
+            job = queue.front();
+            queue.pop_front();
           }
+
+          // Someone else (the other lane after a promotion, or a draw that hit
+          // the deadline) may already own this compile.
+          if (!claimPsoCompile(job.entry))
+            continue;
 
           // Heavy compile off the frame thread. compilePso touches only the
           // entry + the mutex-guarded shader caches + unixcalls, never the
           // PSO map, so no s_psoMutex is needed here.
           compilePso(job.entry, job.key);
+          finishPsoCompile(job.entry);
         }
       }
 
       dxvk::mutex                m_mutex;
-      dxvk::condition_variable   m_cond;
-      std::deque<Job>            m_queue;
+      dxvk::condition_variable   m_urgentCond;
+      dxvk::condition_variable   m_backgroundCond;
+      std::deque<Job>            m_urgent;      // a draw is blocked on these
+      std::deque<Job>            m_background;  // speculative pre-warm
       std::vector<dxvk::thread>  m_threads;
       bool                       m_started = false;
       bool                       m_stop    = false;
@@ -1205,7 +1334,7 @@ namespace dxvk::d9mt {
         s_prewarmRecords.clear(); s_pendingByHash.clear(); s_prewarmRemaining = 0;
         s_prewarmPersisted.clear();
       }
-      d9mt::logf("d9mt: PSO pre-warm: %u recorded PSOs to replay", s_prewarmRemaining);
+      d9mt::logAlways("d9mt: PSO pre-warm: %u recorded PSOs to replay", s_prewarmRemaining);
     }
   }
 
@@ -1231,7 +1360,7 @@ namespace dxvk::d9mt {
   // fwd: defined just below, builds+enqueues a PSO from a key (caller holds s_psoMutex)
   static void prewarmShaderSeen(uint64_t newHash);
 
-  static const PsoEntry* getRenderPso(
+  static PsoEntry* getRenderPso(
     const PsoKey&         key,
     const Rc<DxvkShader>& vs,
     const Rc<DxvkShader>& fs) {
@@ -1278,14 +1407,102 @@ namespace dxvk::d9mt {
     // a state that fails never lands in the cache file to be replayed next run.
 
     if (asyncPsoEnabled()) {
-      // pso stays 0 until the worker finishes; the draw site skips until then.
-      s_psoWorkers.enqueue(key, ptr);
+      // Urgent lane: this miss came from a draw that is being dropped right
+      // now, so it must not queue behind the speculative pre-warm backlog.
+      // pso stays 0 until the compile finishes; the draw site skips (and, past
+      // the deadline, takes the compile over) until then.
+      s_psoWorkers.enqueue(key, ptr, true);
     } else {
       D9MT_ZONE(d9mt::ZonePsoCreate);
+      claimPsoCompile(ptr);
       compilePso(ptr, key);
+      finishPsoCompile(ptr);
     }
 
     return ptr;
+  }
+
+  // A draw resolved its pipeline but the pipeline isn't hot yet, so the draw is
+  // about to be dropped. Called on the CS thread with NO lock held (never from
+  // inside getRenderPso — the inline compile below must not run under
+  // s_psoMutex, which every other draw needs to look anything up).
+  //
+  // Returns true if the pipeline became usable here (compiled inline), false if
+  // the caller should skip this draw. Three things happen:
+  //   - the pipeline is promoted into the urgent lane, once, so it stops
+  //     waiting behind speculative pre-warm compiles;
+  //   - past D9MT_PSO_DEADLINE_MS of skipped draws the compile is taken over by
+  //     this thread, trading one frame hitch for geometry that would otherwise
+  //     stay missing for as long as the queue takes to drain;
+  //   - the stall is counted and reported at ~1 Hz, in the release build too.
+  static bool psoAwaitStalled(PsoEntry* entry, const PsoKey& key) {
+    // Done with pso still 0 = this pipeline failed to build and never will;
+    // there is nothing to promote or wait for, only draws to account for.
+    const bool failed = entry->compileState.load(std::memory_order_acquire)
+                     == uint32_t(PsoCompileState::Done);
+
+    if (failed)
+      s_failedDraws.fetch_add(1, std::memory_order_relaxed);
+    else
+      s_skippedDraws.fetch_add(1, std::memory_order_relaxed);
+
+    const uint64_t now = nowNs();
+
+    if (!failed && !entry->promoted.exchange(1, std::memory_order_relaxed)) {
+      entry->firstSkipNs.store(now, std::memory_order_relaxed);
+      // Re-queueing an entry that a worker may already hold is safe: whoever
+      // wins claimPsoCompile does the work and the other side drops the job.
+      if (asyncPsoEnabled()
+       && entry->compileState.load(std::memory_order_acquire)
+            == uint32_t(PsoCompileState::Queued))
+        s_psoWorkers.enqueue(key, entry, true);
+    }
+
+    // A second context's CS thread can get here between the promotion above and
+    // its firstSkipNs store; treat the unset stamp as "starts now" rather than
+    // as an infinitely old wait that would compile inline on the first skip.
+    const uint64_t firstSkip = entry->firstSkipNs.load(std::memory_order_relaxed);
+    const uint64_t deadline  = psoDeadlineNs();
+    const uint64_t since     = firstSkip ? now - firstSkip : 0u;
+
+    // Duty cycle: after an inline compile, refuse the next one for as long as
+    // that compile took. A level's worth of cold pipelines all coming due at
+    // once would otherwise freeze the frame thread solid for seconds — which
+    // reads as a hung game, not as a fix. At 50% the world fills in while the
+    // game keeps running (at worst half rate), and the urgent workers are
+    // chewing through the same backlog in parallel the whole time.
+    if (!failed && deadline && since >= deadline
+     && now >= s_inlineReadyNs.load(std::memory_order_relaxed)
+     && claimPsoCompile(entry)) {
+      // Nobody had started it, so the queue is the problem, not the compiler.
+      D9MT_ZONE(d9mt::ZonePsoCreate);
+      compilePso(entry, key);
+      finishPsoCompile(entry);
+
+      const uint64_t spent = nowNs() - now;
+      s_inlineReadyNs.store(nowNs() + spent, std::memory_order_relaxed);
+      s_inlineCompiles.fetch_add(1, std::memory_order_relaxed);
+      return entry->pso.load(std::memory_order_acquire) != 0;
+    }
+
+    // ~1 Hz summary. The whole class of "the world is black and the log says
+    // nothing" bugs lives here, so this uses the always-compiled channel.
+    uint64_t last = s_lastStallLogNs.load(std::memory_order_relaxed);
+    if (now - last >= 1000000000ull
+     && s_lastStallLogNs.compare_exchange_strong(last, now,
+          std::memory_order_relaxed)) {
+      size_t urgentDepth = 0, backgroundDepth = 0;
+      s_psoWorkers.queueDepths(&urgentDepth, &backgroundDepth);
+      d9mt::logAlways("d9mt: PSO stall: %llu draws skipped (pipeline not hot), "
+        "%llu dropped (pipeline failed), %llu compiled inline, "
+        "queue %zu urgent / %zu background",
+        (unsigned long long) s_skippedDraws.load(std::memory_order_relaxed),
+        (unsigned long long) s_failedDraws.load(std::memory_order_relaxed),
+        (unsigned long long) s_inlineCompiles.load(std::memory_order_relaxed),
+        urgentDepth, backgroundDepth);
+    }
+
+    return false;
   }
 
   // Caller holds s_psoMutex. A shader (newHash) just became known this run: build
@@ -1314,7 +1531,7 @@ namespace dxvk::d9mt {
         entry->fsRef = fsIt->second;
         PsoEntry* ptr = entry.get();
         s_psoCache.emplace(key, std::move(entry));
-        s_psoWorkers.enqueue(key, ptr); // background pre-compile
+        s_psoWorkers.enqueue(key, ptr, false); // speculative: background lane
       }
       rec.done = true;
       if (s_prewarmRemaining) s_prewarmRemaining--;
@@ -1525,7 +1742,7 @@ namespace dxvk::d9mt {
     // passes attach a visibility-result buffer while this is non-zero
     uint32_t            activeOcclusionCount = 0u;
 
-    const PsoEntry*     pso = nullptr;
+    PsoEntry*           pso = nullptr;
 
     // Single-entry memo for the render-PSO lookup. Consecutive draws very often
     // resolve to the same pipeline, so cache the last key + result and skip the
@@ -1534,7 +1751,7 @@ namespace dxvk::d9mt {
     // byte what a fresh lookup would return, so this changes timing only, never
     // observable behavior (downstream dirty/AB logic is unaffected).
     PsoKey              lastPsoKey = { };
-    const PsoEntry*     lastPsoEntry = nullptr;
+    PsoEntry*           lastPsoEntry = nullptr;
   };
 
   namespace {
@@ -4690,7 +4907,7 @@ namespace dxvk {
     // Memo hit: same key as the previous draw → reuse the resolved entry and
     // skip the hash + mutex + map probe. entry->pso is atomic, so a still-
     // compiling entry memoed here is re-checked below and picked up once ready.
-    const d9mt::PsoEntry* entry;
+    d9mt::PsoEntry* entry;
     if (dstate.lastPsoEntry && key == dstate.lastPsoKey) {
       entry = dstate.lastPsoEntry;
     } else {
@@ -4701,8 +4918,16 @@ namespace dxvk {
       }
     }
 
-    if (!entry || !entry->pso)
+    if (!entry)
       return false; // creation failure already logged once
+
+    if (!entry->pso.load(std::memory_order_acquire)) {
+      // Not hot yet (or permanently failed). psoAwaitStalled promotes it, and
+      // past the deadline compiles it here, so a pipeline the frame is waiting
+      // on can't be starved by the pre-warm backlog indefinitely.
+      if (!d9mt::psoAwaitStalled(entry, key))
+        return false;
+    }
 
     if (dstate.pso != entry) {
       // The set-0 argument-buffer LAYOUT comes from shader reflection, so it
