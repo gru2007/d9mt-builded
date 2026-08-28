@@ -20,11 +20,13 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <map>
+#include <mutex>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -788,6 +790,14 @@ namespace dxvk::d9mt {
     // Once the wait exceeds the deadline the draw compiles the pipeline itself
     // rather than dropping the geometry for another frame.
     std::atomic<uint64_t> firstSkipNs { 0 };
+
+    // Source frequently submits the entire opaque world through a newly-seen
+    // pipeline. Dropping that draw is not an acceptable asynchronous compile
+    // strategy: the resulting frame is a perfectly presented black image.
+    // Waiters use this condition when compatibility mode requires the first
+    // use of a pipeline to be complete before its draw is encoded.
+    std::mutex              readyMutex;
+    std::condition_variable readyCond;
   };
 
   struct PsoKey {
@@ -1085,8 +1095,23 @@ namespace dxvk::d9mt {
     }
 
     void finishPsoCompile(PsoEntry* entry) {
-      entry->compileState.store(uint32_t(PsoCompileState::Done),
-        std::memory_order_release);
+      {
+        std::lock_guard<std::mutex> lock(entry->readyMutex);
+        entry->compileState.store(uint32_t(PsoCompileState::Done),
+          std::memory_order_release);
+      }
+      entry->readyCond.notify_all();
+    }
+
+    // Skipping a draw while its PSO compiles changes D3D9 semantics. It is
+    // useful as an explicitly requested stutter/visual-corruption trade-off,
+    // but is unsafe as the default (notably for Source's opaque world pass).
+    bool asyncPsoSkipEnabled() {
+      static const bool enabled = [] {
+        const char* v = std::getenv("D9MT_ASYNC_SKIP");
+        return v && v[0] && std::strcmp(v, "0") != 0;
+      }();
+      return enabled;
     }
 
     // Stall accounting for the 1 Hz report. Draws are skipped on the CS
@@ -1436,6 +1461,29 @@ namespace dxvk::d9mt {
   //     stay missing for as long as the queue takes to drain;
   //   - the stall is counted and reported at ~1 Hz, in the release build too.
   static bool psoAwaitStalled(PsoEntry* entry, const PsoKey& key) {
+    // Correctness mode (the default): take a queued compile onto this thread,
+    // or wait for the worker which already owns it. The old path returned from
+    // the draw without encoding it, which is observable and can erase the
+    // whole Source world for a frame (or many frames under compile pressure).
+    // Async compilation still pre-warms recorded PSOs; it simply cannot drop
+    // an application draw unless D9MT_ASYNC_SKIP=1 explicitly opts into that.
+    if (!asyncPsoSkipEnabled()) {
+      if (claimPsoCompile(entry)) {
+        D9MT_ZONE(d9mt::ZonePsoCreate);
+        compilePso(entry, key);
+        finishPsoCompile(entry);
+      } else if (entry->compileState.load(std::memory_order_acquire)
+              != uint32_t(PsoCompileState::Done)) {
+        std::unique_lock<std::mutex> lock(entry->readyMutex);
+        entry->readyCond.wait(lock, [entry] {
+          return entry->compileState.load(std::memory_order_acquire)
+              == uint32_t(PsoCompileState::Done);
+        });
+      }
+
+      return entry->pso.load(std::memory_order_acquire) != 0;
+    }
+
     // Done with pso still 0 = this pipeline failed to build and never will;
     // there is nothing to promote or wait for, only draws to account for.
     const bool failed = entry->compileState.load(std::memory_order_acquire)
