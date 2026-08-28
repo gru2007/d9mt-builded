@@ -3849,6 +3849,77 @@ namespace dxvk {
   // Draw-stage operations — fail loud, never silently wrong
   // --------------------------------------------------------------------------
 
+  // Resolve targets for multisampled blit sources, kept per device, format and
+  // size. Source copies its framebuffer two or three times a frame (the glow
+  // pass alone backs the scene up and copies the glow models out), and every
+  // one of those lands here while antialiasing is on: minting a full-screen
+  // texture per copy is an MTLDevice_newTexture per copy, and the memory only
+  // comes back when the command list retires. Reuse is safe for the same
+  // reason the presenter's own resolve texture is reused — one queue, passes
+  // execute in submission order, and the resolve overwrites the whole texture
+  // before anything samples it.
+  //
+  // The cache is leaked on purpose: a static Rc would release its Metal
+  // texture during static destruction, by which time winemetal is gone.
+  namespace {
+
+    struct MsaaResolveTarget {
+      const DxvkDevice* device;
+      VkFormat          format;
+      uint32_t          width;
+      uint32_t          height;
+      Rc<DxvkImage>     image;
+    };
+
+    Rc<DxvkImage> getMsaaResolveTarget(
+            DxvkDevice* device,
+            VkFormat    format,
+            VkExtent3D  extent) {
+      static auto* s_targets = new std::vector<MsaaResolveTarget>();
+      static dxvk::mutex s_mutex;
+
+      std::lock_guard<dxvk::mutex> lock(s_mutex);
+
+      for (const auto& t : *s_targets) {
+        if (t.device == device && t.format == format
+         && t.width == extent.width && t.height == extent.height)
+          return t.image;
+      }
+
+      DxvkImageCreateInfo info = { };
+      info.type        = VK_IMAGE_TYPE_2D;
+      info.format      = format;
+      info.flags       = 0u;
+      info.sampleCount = VK_SAMPLE_COUNT_1_BIT;
+      info.extent      = { extent.width, extent.height, 1u };
+      info.numLayers   = 1u;
+      info.mipLevels   = 1u;
+      info.usage       = VK_IMAGE_USAGE_SAMPLED_BIT
+                       | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT
+                       | VK_IMAGE_USAGE_TRANSFER_SRC_BIT
+                       | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+      info.stages      = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+      info.access      = VK_ACCESS_SHADER_READ_BIT;
+      info.tiling      = VK_IMAGE_TILING_OPTIMAL;
+      info.layout      = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+      Rc<DxvkImage> image;
+
+      try {
+        image = device->createImage(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+      } catch (const DxvkError& e) {
+        Logger::err(str::format("d9mt: blitImageView: failed to create resolve "
+          "image: ", e.message()));
+        return nullptr;
+      }
+
+      s_targets->push_back({ device, format, extent.width, extent.height, image });
+      return image;
+    }
+
+  }
+
+
   void DxvkContext::blitImageView(
     const Rc<DxvkImageView>&    dstView,
     const VkOffset3D*           dstOffsets,
@@ -3893,7 +3964,7 @@ namespace dxvk {
     this->prepareImage(srcView->image(), srcView->imageSubresources());
 
     // The source the sample pass actually reads. A multisampled source is
-    // resolved into a transient 1-sample image first: Metal cannot sample an
+    // resolved into a cached 1-sample image first: Metal cannot sample an
     // MSAA texture from the blit shader, and the front-end only lands here
     // with one when the copy also scales or converts formats, so its own
     // resolve fast path did not apply. Dropping the blit instead loses a
@@ -3912,32 +3983,11 @@ namespace dxvk {
     if (srcImage->info().sampleCount != VK_SAMPLE_COUNT_1_BIT) {
       VkExtent3D msaaExtent = srcImage->mipLevelExtent(srcMip);
 
-      DxvkImageCreateInfo tmpInfo = { };
-      tmpInfo.type        = VK_IMAGE_TYPE_2D;
-      tmpInfo.format      = srcImage->info().format;
-      tmpInfo.flags       = 0u;
-      tmpInfo.sampleCount = VK_SAMPLE_COUNT_1_BIT;
-      tmpInfo.extent      = { msaaExtent.width, msaaExtent.height, 1u };
-      tmpInfo.numLayers   = 1u;
-      tmpInfo.mipLevels   = 1u;
-      tmpInfo.usage       = VK_IMAGE_USAGE_SAMPLED_BIT
-                          | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT
-                          | VK_IMAGE_USAGE_TRANSFER_SRC_BIT
-                          | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-      tmpInfo.stages      = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
-      tmpInfo.access      = VK_ACCESS_SHADER_READ_BIT;
-      tmpInfo.tiling      = VK_IMAGE_TILING_OPTIMAL;
-      tmpInfo.layout      = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+      Rc<DxvkImage> resolved = getMsaaResolveTarget(
+        m_device.ptr(), srcImage->info().format, msaaExtent);
 
-      Rc<DxvkImage> resolved;
-
-      try {
-        resolved = m_device->createImage(tmpInfo, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-      } catch (const DxvkError& e) {
-        Logger::err(str::format("d9mt: blitImageView: failed to create resolve "
-          "image: ", e.message()));
+      if (resolved == nullptr)
         return;
-      }
 
       VkImageResolve region = { };
       region.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, srcMip, srcLayer, 1u };
