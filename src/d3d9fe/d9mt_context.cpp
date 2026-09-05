@@ -798,6 +798,19 @@ namespace dxvk::d9mt {
     // use of a pipeline to be complete before its draw is encoded.
     std::mutex              readyMutex;
     std::condition_variable readyCond;
+
+    // Priority donation. Set by a BACKGROUND (lowest-priority) worker to its
+    // own OS thread handle for exactly as long as it owns this entry's
+    // compile, 0 otherwise. Since the default mode blocks the frame thread on
+    // a compile it does not own, a pre-warm job the frame thread ends up
+    // waiting on is a textbook priority inversion: the CS thread stops dead
+    // while the thread holding the thing it needs runs at a priority the OS is
+    // free to starve for whole seconds. The waiter reads this and raises that
+    // thread to normal for the duration. Urgent-lane workers never publish
+    // here (already normal), and neither does an inline CS-thread compile —
+    // donating to the frame thread's own handle would rewrite a priority the
+    // application chose.
+    std::atomic<uintptr_t> compilerThread { 0 };
   };
 
   struct PsoKey {
@@ -1097,6 +1110,10 @@ namespace dxvk::d9mt {
     void finishPsoCompile(PsoEntry* entry) {
       {
         std::lock_guard<std::mutex> lock(entry->readyMutex);
+        // Withdraw the donation target BEFORE publishing Done, so a waiter
+        // that wakes up can never read a handle whose job has already ended
+        // and boost a background thread that has moved on to other work.
+        entry->compilerThread.store(0, std::memory_order_relaxed);
         entry->compileState.store(uint32_t(PsoCompileState::Done),
           std::memory_order_release);
       }
@@ -1121,6 +1138,18 @@ namespace dxvk::d9mt {
     std::atomic<uint64_t> s_inlineCompiles { 0 };
     std::atomic<uint64_t> s_lastStallLogNs { 0 };
     std::atomic<uint64_t> s_inlineReadyNs  { 0 }; // inline-compile duty cycle
+
+    // Blocking-mode accounting. In the default (correct) mode no draw is ever
+    // dropped, so the skip counters above stay at zero and the old report said
+    // nothing at all while the frame thread was spending most of its time
+    // inside the pipeline compiler. These are what that mode actually costs:
+    // compiles taken over by the frame thread, waits on a worker that already
+    // owned one, how many of those waits had to donate priority to a pre-warm
+    // worker, and the total wall time the frame thread spent blocked.
+    std::atomic<uint64_t> s_awaitedCompiles  { 0 };
+    std::atomic<uint64_t> s_donatedCompiles  { 0 };
+    std::atomic<uint64_t> s_psoBlockedNs     { 0 };
+    std::atomic<uint64_t> s_reportedBlockedNs{ 0 };
 
     class PsoWorkers {
 
@@ -1212,14 +1241,36 @@ namespace dxvk::d9mt {
         auto& queue = urgentLane ? m_urgent : m_background;
         auto& cond  = urgentLane ? m_urgentCond : m_backgroundCond;
 
+        // A real handle to this thread, for the priority donation in
+        // psoAwaitStalled: GetCurrentThread() is a pseudo-handle that only
+        // means "me" in the thread that calls it, so it is useless to hand to
+        // a waiter. Only the background lane needs one (see PsoEntry::
+        // compilerThread); if duplication fails we simply never donate, which
+        // costs latency on a stall and nothing else.
+        HANDLE self = nullptr;
+
+        if (!urgentLane) {
+          DuplicateHandle(GetCurrentProcess(), GetCurrentThread(),
+            GetCurrentProcess(), &self, 0, FALSE, DUPLICATE_SAME_ACCESS);
+        }
+
         for (;;) {
+          // Back down to the background priority at every job boundary. A
+          // donation raises this thread mid-job and the donor has no way to
+          // know when the job ends, so the restore has to live here — that
+          // also cleans up after a donation that landed just as a job
+          // finished, which would otherwise leave a pre-warm worker running
+          // at normal priority for the rest of the session.
+          if (self)
+            SetThreadPriority(self, THREAD_PRIORITY_LOWEST);
+
           Job job;
           {
             std::unique_lock<dxvk::mutex> lk(m_mutex);
             cond.wait(lk, [this, &queue] { return m_stop || !queue.empty(); });
             if (queue.empty()) {
               if (m_stop)
-                return;
+                break;
               continue;
             }
             job = queue.front();
@@ -1231,12 +1282,25 @@ namespace dxvk::d9mt {
           if (!claimPsoCompile(job.entry))
             continue;
 
+          // Publish the donation target for the whole compile. Ordering: the
+          // store must be visible before a waiter can observe Running, which
+          // it already is — the waiter only reads this after failing to claim
+          // the entry, and claimPsoCompile's acq_rel CAS is what made Running
+          // visible in the first place.
+          if (self) {
+            job.entry->compilerThread.store(uintptr_t(self),
+              std::memory_order_release);
+          }
+
           // Heavy compile off the frame thread. compilePso touches only the
           // entry + the mutex-guarded shader caches + unixcalls, never the
           // PSO map, so no s_psoMutex is needed here.
           compilePso(job.entry, job.key);
-          finishPsoCompile(job.entry);
+          finishPsoCompile(job.entry); // clears compilerThread
         }
+
+        if (self)
+          CloseHandle(self);
       }
 
       dxvk::mutex                m_mutex;
@@ -1253,6 +1317,50 @@ namespace dxvk::d9mt {
     // Declared AFTER s_psoCache so it destructs (and joins workers) FIRST,
     // before the cache they reference is torn down.
     PsoWorkers s_psoWorkers;
+
+    // ~1 Hz pipeline-stall summary on the always-compiled channel. The whole
+    // class of "the world is black / half the props are missing and the log
+    // says nothing" bugs lives here, so it must survive the release build and
+    // it must fire in BOTH modes: dropped draws in skip mode, and blocked
+    // frame-thread time in the default mode. Quiet when there is nothing to
+    // say, so it costs nothing once a level is warm.
+    void reportPsoStalls() {
+      const uint64_t blocked = s_psoBlockedNs.load(std::memory_order_relaxed);
+      const uint64_t skipped = s_skippedDraws.load(std::memory_order_relaxed);
+      const uint64_t failed  = s_failedDraws.load(std::memory_order_relaxed);
+
+      // Nothing new since the last report: stay silent.
+      if (!skipped && !failed
+       && blocked == s_reportedBlockedNs.load(std::memory_order_relaxed))
+        return;
+
+      const uint64_t now = nowNs();
+      uint64_t last = s_lastStallLogNs.load(std::memory_order_relaxed);
+
+      if (now - last < 1000000000ull
+       || !s_lastStallLogNs.compare_exchange_strong(last, now,
+            std::memory_order_relaxed))
+        return;
+
+      const uint64_t prevBlocked =
+        s_reportedBlockedNs.exchange(blocked, std::memory_order_relaxed);
+
+      size_t urgentDepth = 0, backgroundDepth = 0;
+      s_psoWorkers.queueDepths(&urgentDepth, &backgroundDepth);
+
+      d9mt::logAlways("d9mt: PSO stall: %llu draws skipped (pipeline not hot), "
+        "%llu dropped (pipeline FAILED — geometry is missing), "
+        "%llu compiled on the frame thread, %llu waited on a worker "
+        "(%llu needed a priority donation), %llu ms blocked this second, "
+        "queue %zu urgent / %zu background",
+        (unsigned long long) skipped,
+        (unsigned long long) failed,
+        (unsigned long long) s_inlineCompiles.load(std::memory_order_relaxed),
+        (unsigned long long) s_awaitedCompiles.load(std::memory_order_relaxed),
+        (unsigned long long) s_donatedCompiles.load(std::memory_order_relaxed),
+        (unsigned long long) ((blocked - prevBlocked) / 1000000ull),
+        urgentDepth, backgroundDepth);
+    }
 
   }
 
@@ -1468,20 +1576,50 @@ namespace dxvk::d9mt {
     // Async compilation still pre-warms recorded PSOs; it simply cannot drop
     // an application draw unless D9MT_ASYNC_SKIP=1 explicitly opts into that.
     if (!asyncPsoSkipEnabled()) {
+      const uint64_t start = nowNs();
+
       if (claimPsoCompile(entry)) {
         D9MT_ZONE(d9mt::ZonePsoCreate);
         compilePso(entry, key);
         finishPsoCompile(entry);
+        s_inlineCompiles.fetch_add(1, std::memory_order_relaxed);
       } else if (entry->compileState.load(std::memory_order_acquire)
               != uint32_t(PsoCompileState::Done)) {
+        // Donate this thread's urgency to whoever owns the compile. Without
+        // this, a pipeline a draw needs that happens to have been picked up by
+        // the lowest-priority pre-warm lane blocks the frame thread for as
+        // long as the OS feels like starving that worker.
+        uintptr_t compiler = entry->compilerThread.load(std::memory_order_acquire);
+        if (compiler) {
+          SetThreadPriority(reinterpret_cast<HANDLE>(compiler),
+            THREAD_PRIORITY_NORMAL);
+          s_donatedCompiles.fetch_add(1, std::memory_order_relaxed);
+        }
+
         std::unique_lock<std::mutex> lock(entry->readyMutex);
         entry->readyCond.wait(lock, [entry] {
           return entry->compileState.load(std::memory_order_acquire)
               == uint32_t(PsoCompileState::Done);
         });
+        s_awaitedCompiles.fetch_add(1, std::memory_order_relaxed);
       }
 
-      return entry->pso.load(std::memory_order_acquire) != 0;
+      s_psoBlockedNs.fetch_add(nowNs() - start, std::memory_order_relaxed);
+
+      if (entry->pso.load(std::memory_order_acquire)) {
+        reportPsoStalls();
+        return true;
+      }
+
+      // Permanently failed. The draw is dropped, and it will be dropped every
+      // frame from here on — geometry silently missing for the rest of the
+      // session. compilePso logged the cause once; count it so the periodic
+      // report below says how much of the frame is disappearing, which is the
+      // difference between "the world is black" and "the world is black and
+      // here is why".
+      s_failedDraws.fetch_add(1, std::memory_order_relaxed);
+      reportPsoStalls();
+      return false;
     }
 
     // Done with pso still 0 = this pipeline failed to build and never will;
@@ -1533,23 +1671,7 @@ namespace dxvk::d9mt {
       return entry->pso.load(std::memory_order_acquire) != 0;
     }
 
-    // ~1 Hz summary. The whole class of "the world is black and the log says
-    // nothing" bugs lives here, so this uses the always-compiled channel.
-    uint64_t last = s_lastStallLogNs.load(std::memory_order_relaxed);
-    if (now - last >= 1000000000ull
-     && s_lastStallLogNs.compare_exchange_strong(last, now,
-          std::memory_order_relaxed)) {
-      size_t urgentDepth = 0, backgroundDepth = 0;
-      s_psoWorkers.queueDepths(&urgentDepth, &backgroundDepth);
-      d9mt::logAlways("d9mt: PSO stall: %llu draws skipped (pipeline not hot), "
-        "%llu dropped (pipeline failed), %llu compiled inline, "
-        "queue %zu urgent / %zu background",
-        (unsigned long long) s_skippedDraws.load(std::memory_order_relaxed),
-        (unsigned long long) s_failedDraws.load(std::memory_order_relaxed),
-        (unsigned long long) s_inlineCompiles.load(std::memory_order_relaxed),
-        urgentDepth, backgroundDepth);
-    }
-
+    reportPsoStalls();
     return false;
   }
 
@@ -3880,10 +4002,22 @@ namespace dxvk {
 
       std::lock_guard<dxvk::mutex> lock(s_mutex);
 
-      for (const auto& t : *s_targets) {
-        if (t.device == device && t.format == format
-         && t.width == extent.width && t.height == extent.height)
+      for (auto& t : *s_targets) {
+        if (t.device != device || t.format != format)
+          continue;
+
+        if (t.width == extent.width && t.height == extent.height)
           return t.image;
+
+        // Same device and format at a different size: the old one can never be
+        // asked for again. Dropping the Rc here is what keeps a resolution
+        // change, a windowed<->fullscreen toggle or an MSAA level change from
+        // stranding a full-screen texture per size the game has ever used —
+        // and the entries are never erased, so this loop stays O(formats).
+        t.width  = extent.width;
+        t.height = extent.height;
+        t.image  = nullptr;
+        break;
       }
 
       DxvkImageCreateInfo info = { };
@@ -3911,6 +4045,17 @@ namespace dxvk {
         Logger::err(str::format("d9mt: blitImageView: failed to create resolve "
           "image: ", e.message()));
         return nullptr;
+      }
+
+      // Reuse the slot the size check above just invalidated, if there was one;
+      // otherwise this is a format the game has not resolved before.
+      for (auto& t : *s_targets) {
+        if (t.device == device && t.format == format) {
+          t.width  = extent.width;
+          t.height = extent.height;
+          t.image  = image;
+          return image;
+        }
       }
 
       s_targets->push_back({ device, format, extent.width, extent.height, image });

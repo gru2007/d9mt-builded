@@ -61,10 +61,33 @@ enum d9mt_source_kind {
   D9MT_SOURCE_DXBC = 2,
 };
 
+/* Float math mode the MSL compiler is asked for. Selected PE-side (d3d9fe
+ * shaderMathMode(), D9MT_MATH) and folded into the metallib cache key, so a
+ * flipped mode recompiles instead of reusing a library built under the other
+ * one. Values are an enum, NOT a bitmask.
+ *
+ *   SAFE    - MTLMathModeSafe:    IEEE 754. No reassociation, no contraction,
+ *             no approximate divide/sqrt/transcendentals. Slowest, exact.
+ *   FAST    - MTLMathModeFast:    -ffast-math. Reassociates, contracts, and
+ *             assumes no NaN/Inf. Fastest, and the assumption is what turns a
+ *             degenerate normalize()/pow() into visible garbage.
+ *   RELAXED - MTLMathModeRelaxed: approximate math within a defined tolerance
+ *             but NaN/Inf semantics preserved. This is what D3D9 hardware
+ *             actually guaranteed (rcp/rsq were ~1 ULP, log/exp ~21 bits), so
+ *             it is the closest match to the API being emulated. */
+enum d9mt_math_mode {
+  D9MT_MATH_SAFE    = 0,
+  D9MT_MATH_FAST    = 1,
+  D9MT_MATH_RELAXED = 2,
+};
+
 /* target_flags bits: codegen/compile options that affect the artifact bytes.
- * (msl language version is implicit 3.0 today; folded into the key PE-side.) */
+ * (msl language version is implicit 3.0 today; folded into the key PE-side.)
+ * The two math bits encode enum d9mt_math_mode: neither set = SAFE, FAST_MATH
+ * = FAST, RELAXED_MATH = RELAXED. Both set is invalid and read as RELAXED. */
 enum d9mt_target_flags {
-  D9MT_TARGET_FAST_MATH = 1u << 0,
+  D9MT_TARGET_FAST_MATH    = 1u << 0,
+  D9MT_TARGET_RELAXED_MATH = 1u << 1,
 };
 
 /* ret_status values (observable, never branched on for control flow). */
@@ -92,7 +115,11 @@ struct d9mt_newlibrary_params {
   uint64_t device;     /* in:  obj_handle_t MTLDevice */
   uint64_t source_ptr; /* in:  const char* UTF-8 MSL  */
   uint64_t source_len; /* in */
-  uint32_t fast_math;  /* in:  bool */
+  /* in: enum d9mt_math_mode. Historically a bool, and the enum keeps that
+   * meaning: 0 = SAFE (the old "false"), 1 = FAST (the old "true"), 2 =
+   * RELAXED. d9mt's own internal MSL (blit/resolve/clear) passes 1 and stays
+   * on fast math — it has no user-authored precision to preserve. */
+  uint32_t fast_math;
   uint32_t padding;
   uint64_t ret_library; /* out: retained MTLLibrary or 0 */
   uint64_t ret_error;   /* out: retained NSError or 0 (caller releases) */

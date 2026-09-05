@@ -28,38 +28,66 @@ extern char **environ;
 typedef int NTSTATUS; /* wine unixlib_entry_t contract */
 #define STATUS_SUCCESS 0
 
+/* enum d9mt_math_mode -> MTLMathMode. The caller picks the mode (d3d9fe
+ * shaderMathMode(), D9MT_MATH) and it is folded into the metallib cache key, so
+ * every compile path here MUST agree: a library compiled under one mode and
+ * reused under another is exactly the class of bug the key exists to prevent.
+ * Unknown values fall back to RELAXED rather than FAST: an out-of-range mode
+ * must never silently re-enable the no-NaN/no-Inf assumption. */
+static MTLMathMode d9mt_math_mode(uint32_t mode) {
+  switch (mode) {
+    case D9MT_MATH_SAFE: return MTLMathModeSafe;
+    case D9MT_MATH_FAST: return MTLMathModeFast;
+    default:             return MTLMathModeRelaxed;
+  }
+}
+
+/* target_flags bits -> enum d9mt_math_mode. */
+static uint32_t d9mt_math_mode_from_flags(uint32_t flags) {
+  if (flags & D9MT_TARGET_RELAXED_MATH)
+    return D9MT_MATH_RELAXED;
+  if (flags & D9MT_TARGET_FAST_MATH)
+    return D9MT_MATH_FAST;
+  return D9MT_MATH_SAFE;
+}
+
 static NTSTATUS d9mt_new_library_from_source(void *args) {
   struct d9mt_newlibrary_params *p = args;
   p->ret_library = 0;
   p->ret_error = 0;
 
-  id<MTLDevice> device = (id<MTLDevice>)(uintptr_t)p->device;
-  NSString *src =
-      [[NSString alloc] initWithBytes:(const void *)(uintptr_t)p->source_ptr
-                               length:(NSUInteger)p->source_len
-                             encoding:NSUTF8StringEncoding];
-  if (!src)
-    return STATUS_SUCCESS;
+  /* A wine unixcall thread has no ambient autorelease pool. Without one every
+   * autoreleased temporary the Metal compiler produces — and the +0 `err`
+   * out-param below — leaks for the process lifetime, once per compiled
+   * shader, and objc logs "autoreleased with no pool in place" for each.
+   * d9mt_library_for_key already wraps its body for this reason; this path
+   * (D9MT_METALLIB_CACHE=0, and every internal blit/resolve/clear shader)
+   * was missing it. The retained returns below survive the drain. */
+  @autoreleasepool {
+    id<MTLDevice> device = (id<MTLDevice>)(uintptr_t)p->device;
+    NSString *src =
+        [[NSString alloc] initWithBytes:(const void *)(uintptr_t)p->source_ptr
+                                 length:(NSUInteger)p->source_len
+                               encoding:NSUTF8StringEncoding];
+    if (!src)
+      return STATUS_SUCCESS;
 
-  MTLCompileOptions *opts = [[MTLCompileOptions alloc] init];
-  opts.languageVersion = MTLLanguageVersion3_0;
-  // FAST math, unconditionally — the only mode that keeps D3D9 shader semantics
-  // correct here. D3D9 assumes fast-math float behavior; .relaxed/.safe change
-  // reassociation/rounding enough to corrupt shader-computed positions (collapsed
-  // geometry) and cost framerate. Any precision artifact from .fast is a per-shader
-  // translation bug (e.g. unguarded normalize()/rsqrt producing unclamped NaN),
-  // fixed in the SPIR-V->MSL path — never by globally slowing every game's math.
-  opts.mathMode = MTLMathModeFast;
+    MTLCompileOptions *opts = [[MTLCompileOptions alloc] init];
+    opts.languageVersion = MTLLanguageVersion3_0;
+    /* Math mode is the caller's (see d9mt_math_mode). d9mt's own internal MSL
+     * passes FAST; game shaders pass whatever D9MT_MATH selected. */
+    opts.mathMode = d9mt_math_mode((uint32_t)p->fast_math);
 
-  NSError *err = nil;
-  id<MTLLibrary> lib = [device newLibraryWithSource:src
-                                            options:opts
-                                              error:&err];
-  [opts release];
-  [src release];
+    NSError *err = nil;
+    id<MTLLibrary> lib = [device newLibraryWithSource:src
+                                              options:opts
+                                                error:&err];
+    [opts release];
+    [src release];
 
-  p->ret_library = (uint64_t)(uintptr_t)lib; /* newLibrary* returns +1 */
-  p->ret_error = (uint64_t)(uintptr_t)[err retain];
+    p->ret_library = (uint64_t)(uintptr_t)lib; /* newLibrary* returns +1 */
+    p->ret_error = (uint64_t)(uintptr_t)[err retain];
+  }
   return STATUS_SUCCESS;
 }
 
@@ -480,7 +508,7 @@ static NSString *d9mt_metal_tool_path(void) {
  * failure (so the caller degrades to SourceBackend). Out-of-process => does
  * NOT hold the Metal compile lock => no stutter even on a miss. */
 static NSData *d9mt_cli_compile(const char *source, size_t source_len,
-                                bool fast_math) {
+                                uint32_t math_mode) {
   NSString *tool = d9mt_metal_tool_path();
   if (!tool)
     return nil;
@@ -511,13 +539,20 @@ static NSData *d9mt_cli_compile(const char *source, size_t source_len,
   }
 
   if (wrote) {
+    // Must match opts.mathMode in the in-process path: the cache key encodes
+    // the mode, so an entry compiled by either backend has to mean the same
+    // thing. -ffast-math / -fno-fast-math are accepted by every Metal
+    // toolchain; -fmetal-math-mode= needs Metal 3.2, and if an older one
+    // rejects it the compile fails and the caller degrades to the source
+    // backend — a lost cache entry, never a wrong one.
+    const char *mathFlag =
+        math_mode == D9MT_MATH_FAST    ? "-ffast-math" :
+        math_mode == D9MT_MATH_RELAXED ? "-fmetal-math-mode=relaxed"
+                                       : "-fno-fast-math";
     const char *argv[] = {
         tool.fileSystemRepresentation,
         "-std=metal3.0",
-        // FAST, unconditionally — matches opts.mathMode=fast in the in-process
-        // path (the fast_math arg is ignored; both paths must agree so the disk
-        // cache is consistent regardless of which backend compiled an entry).
-        "-ffast-math",
+        mathFlag,
         "-o", outPath, inPath, NULL };
     pid_t pid = 0;
     int rc = posix_spawn(&pid, argv[0], NULL, NULL,
@@ -554,7 +589,7 @@ static NSData *d9mt_cli_compile(const char *source, size_t source_len,
  * on failure (caller owns it, hands it up the ABI). */
 static id<MTLLibrary>
 d9mt_source_compile(id<MTLDevice> device, const char *source,
-                    size_t source_len, bool fast_math, NSError **err_out) {
+                    size_t source_len, uint32_t math_mode, NSError **err_out) {
   NSString *src = [[NSString alloc] initWithBytes:source
                                            length:source_len
                                          encoding:NSUTF8StringEncoding];
@@ -562,7 +597,7 @@ d9mt_source_compile(id<MTLDevice> device, const char *source,
     return nil;
   MTLCompileOptions *opts = [[MTLCompileOptions alloc] init];
   opts.languageVersion = MTLLanguageVersion3_0;
-  opts.mathMode = MTLMathModeFast;  // fast always
+  opts.mathMode = d9mt_math_mode(math_mode);  // see d9mt_math_mode
 
   __block id<MTLLibrary> out_lib = nil;
   __block NSError *out_err = nil;
@@ -584,10 +619,12 @@ d9mt_source_compile(id<MTLDevice> device, const char *source,
 
   [opts release];
   [src release];
-  if (!out_lib && err_out)
-    *err_out = out_err;  /* already +1; caller hands it up */
-  else
-    [out_err release];   /* lib succeeded but a warning err came too: drop it */
+  if (out_err) {
+    if (!out_lib && err_out)
+      *err_out = out_err;  /* already +1; caller hands it up */
+    else
+      [out_err release];   /* nobody to hand it to: don't leak it */
+  }
   return out_lib;
 }
 
@@ -609,7 +646,7 @@ static NTSTATUS d9mt_library_for_key(void *args) {
 
     const char *source = (const char *)(uintptr_t)p->source_ptr;
     size_t source_len = (size_t)p->source_len;
-    bool fast_math = (p->target_flags & D9MT_TARGET_FAST_MATH) != 0;
+    uint32_t math_mode = d9mt_math_mode_from_flags((uint32_t)p->target_flags);
 
     /* Single path: in-process newLibraryWithSource. No CLI spawn, no temp
      * files, no on-disk .metallib byte cache — MTLCompilerService persists its
@@ -619,7 +656,7 @@ static NTSTATUS d9mt_library_for_key(void *args) {
         p->source_kind == (uint32_t)D9MT_SOURCE_MSL_TEXT) {
       NSError *err = nil;
       id<MTLLibrary> lib =
-          d9mt_source_compile(device, source, source_len, fast_math, &err);
+          d9mt_source_compile(device, source, source_len, math_mode, &err);
       if (lib) {
         p->ret_library = (uint64_t)(uintptr_t)lib;
         p->ret_status = D9MT_LIBRARY_COMPILED;

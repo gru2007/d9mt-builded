@@ -106,6 +106,7 @@ All performance features are **on by default**; set to `0` to disable for A/B.
 | var | default | effect |
 |-----|---------|--------|
 | `D9MT_METALLIB_CACHE` | on | shader disk cache (compile once, reload forever) |
+| `D9MT_MATH` | `safe` | float math mode for game shaders: `safe` (IEEE 754), `relaxed` (approximate transcendentals, NaN/Inf kept — closest to real D3D9 hardware, the one to try if you are GPU-bound), `fast` (`-ffast-math`, assumes no NaN/Inf — faster, and the only mode that can turn a legal shader into visible garbage). `D9MT_FASTMATH=1` is a legacy alias for `fast`. The mode is part of the shader cache key, so switching recompiles rather than reusing the other mode's libraries |
 | `D9MT_ASYNC` | on | pre-warm and compile pipelines on background threads; a cold first use still waits by default for correctness |
 | `D9MT_ASYNC_SKIP` | off | allow draws to be dropped while their pipeline compiles. This may reduce first-use stutter, but can produce black/incomplete frames; intended only for comparison and profiling |
 | `D9MT_PSO_DEADLINE_MS` | `100` | with `D9MT_ASYNC_SKIP=1`, how long a draw may keep being skipped before it compiles the pipeline inline. `0` = never |
@@ -182,6 +183,25 @@ When lossy skipping is explicitly enabled, three things bound it, all in
   dropped, with the queue depths. No line, and the screen still black, means the
   dropped-copy failure above — which reports itself on the `err:` channel, not in
   `d3d9fe.log`.
+
+#### Reading the stall report in the default (blocking) mode
+
+The same `d9mt: PSO stall:` line fires in the default mode, where nothing is
+dropped and the cost shows up as frame time instead. It reports how many
+compiles the frame thread took over, how many it waited on a worker for, and how
+many milliseconds it spent blocked in the last second — so a level-load hitch is
+attributable rather than mysterious. Two fields matter most:
+
+- **`dropped (pipeline FAILED)`** is the only number that means geometry is
+  permanently missing: that pipeline will never build, and the draw will be
+  dropped every frame from here on. The cause was logged once on the `err:`
+  channel when the compile failed.
+- **`needed a priority donation`** counts waits where the pipeline the frame was
+  blocked on happened to be owned by the lowest-priority pre-warm lane. That is
+  a priority inversion — the frame thread stopped dead behind a thread the OS is
+  free to starve — so the waiter now raises that worker to normal priority for
+  the duration of the compile. A large count means pre-warm is repeatedly
+  guessing pipelines just before the game asks for them.
 
 ## How it works (deeper)
 
